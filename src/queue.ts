@@ -54,8 +54,9 @@ export class InMemoryEventQueue {
     return this.getRow(eventId)?.event ?? null;
   }
 
-  getOutstandingRequiredReplyEvent(): BridgeEvent | null {
+  getOutstandingRequiredReplyEvent(filter?: (event: BridgeEvent) => boolean): BridgeEvent | null {
     for (const row of this.conversationRows.values()) {
+      if (filter && !filter(row.event)) continue;
       if (row.event.replyPolicy !== "required") continue;
       if (row.reply?.completed) continue;
       if (row.status === "reserved" || row.status === "delivered") return row.event;
@@ -63,11 +64,12 @@ export class InMemoryEventQueue {
     return null;
   }
 
-  reserveNext(): BridgeEvent | null {
-    if (this.getOutstandingRequiredReplyEvent()) return null;
+  reserveNext(filter?: (event: BridgeEvent) => boolean): BridgeEvent | null {
+    if (this.getOutstandingRequiredReplyEvent(filter)) return null;
 
     for (const row of this.conversationRows.values()) {
       if (row.status !== "pending") continue;
+      if (filter && !filter(row.event)) continue;
       row.status = "reserved";
       return row.event;
     }
@@ -78,6 +80,7 @@ export class InMemoryEventQueue {
         this.statePendingByKey.delete(key);
         continue;
       }
+      if (filter && !filter(row.event)) continue;
       row.status = "reserved";
       this.statePendingByKey.delete(key);
       return row.event;
@@ -114,6 +117,33 @@ export class InMemoryEventQueue {
     }
 
     row.status = "pending";
+  }
+
+  dismiss(eventId: string): void {
+    const row = this.getRow(eventId);
+    if (!row) throw new Error(`Unknown event: ${eventId}`);
+    if (row.status === "pending") {
+      throw new Error(`Event is not reserved: ${eventId}`);
+    }
+
+    row.status = "delivered";
+
+    if (row.event.replyPolicy !== "required") return;
+
+    if (row.reply) {
+      row.reply.completed = true;
+      row.reply.inFlight = false;
+      row.reply.completedAt = new Date().toISOString();
+      return;
+    }
+
+    row.reply = {
+      fingerprint: "__dismissed__",
+      sentCount: 0,
+      completed: true,
+      inFlight: false,
+      completedAt: new Date().toISOString(),
+    };
   }
 
   claimReply(eventId: string, fingerprint: string): ReplyClaim {

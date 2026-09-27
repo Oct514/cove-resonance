@@ -99,14 +99,21 @@ async function tick() {
 
     try {
       await host.updateModelContext(event.modelContext)
-      await host.injectUserMessage(event.visibleText)
+      const result = await host.injectUserMessage(event.visibleText)
+
+      if (result.outcome === "dismissed") {
+        // Host 已经接管过这次投递，但用户/Host 明确取消。
+        // 这是 terminal outcome，不能 release 后让事件复活。
+        await bridge.call("cove_bridge_dismissed", { eventId: id })
+        return
+      }
     } catch (error) {
-      // 只有 Host 尚未接受可见消息时，才允许 release。
+      // Host Adapter 只应在 ui/message 尚未 handoff 时从这里抛错。
       await bridge.call("cove_bridge_release", { eventId: id })
       throw error
     }
 
-    // 从这里开始，用户可见副作用已经发生。
+    // accepted：从这里开始，用户可见副作用已经发生。
     recentlyDispatched.add(id)
     pendingAcks.add(id)
 
@@ -219,9 +226,9 @@ SSE
 
 ---
 
-## 7. delivered / release 的边界
+## 7. delivered / dismissed / release 的边界
 
-这是移植时最容易写错的地方。
+这是移植时最容易写错的地方。不同 Host 可以直接接受 `ui/message`，也可以先要求人工确认；确认 UI 属于 Host 行为，不属于 Bridge 的正确性协议。
 
 ### Host 还没显示成功
 
@@ -233,7 +240,7 @@ release(eventId)
 
 让 Queue 稍后重试。
 
-### Host 已显示成功
+### Host 已接受并显示成功
 
 只能：
 
@@ -249,6 +256,16 @@ release
 ```
 
 否则用户会看到同一句被模型处理多次。
+
+### Host 已接管，但用户明确取消
+
+调用：
+
+```text
+cove_bridge_dismissed(eventId)
+```
+
+这是 terminal outcome。不要 `release`；required reply 的 backpressure 也应该随 dismiss 终结。
 
 ---
 
@@ -304,7 +321,10 @@ Host 此时应等待当前回复完成，不要绕开 Queue 自己取下一条�
 ```ts
 interface MinimalHostAdapter {
   updateModelContext(context: string): Promise<void>
-  injectUserMessage(text: string): Promise<void>
+  // Throw only if the message was never handed to the Host.
+  injectUserMessage(text: string): Promise<{
+    outcome: "accepted" | "dismissed"
+  }>
 
   loadRecentEventIds(): Promise<string[]>
   saveRecentEventIds(ids: string[]): Promise<void>

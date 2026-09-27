@@ -45,8 +45,56 @@ export type AccountProfile = {
   gender: number | null;
 };
 
+export type TogetherPlaylistState = {
+  displayList: string[];
+  randomList: string[];
+  playMode: string | null;
+  versions: Array<{ userId: string; version: number }>;
+};
+
 const require = createRequire(import.meta.url);
 const sdk = require("NeteaseCloudMusicApi") as NcmSdk;
+
+const REALTIME_TOKEN_USER_AGENT =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+  + "AppleWebKit/537.36 (KHTML, like Gecko) "
+  + "Chrome/124.0.0.0 Safari/537.36";
+
+const REALTIME_CLIENT_COOKIE_KEYS = new Set([
+  "os",
+  "osver",
+  "appver",
+  "channel",
+  "versioncode",
+  "buildver",
+  "resolution",
+  "requestid",
+]);
+
+function realtimeTokenCookie(cookie: string, now = Date.now()): string {
+  const preserved = cookie
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .filter((part) => {
+      const separator = part.indexOf("=");
+      const key = (separator >= 0 ? part.slice(0, separator) : part).trim().toLowerCase();
+      return !REALTIME_CLIENT_COOKIE_KEYS.has(key);
+    });
+
+  const requestId = `${now}_${String(Math.floor(Math.random() * 1000)).padStart(4, "0")}`;
+  return [
+    ...preserved,
+    "osver=15.5",
+    "os=osx",
+    "appver=3.1.10.5100",
+    "channel=netease",
+    "versioncode=140",
+    `buildver=${Math.floor(now / 1000)}`,
+    "resolution=1920x1080",
+    `requestId=${requestId}`,
+  ].join("; ");
+}
 
 function readLyric(body: JsonRecord, field: string): string | null {
   return readString(asRecord(body[field]).lyric);
@@ -67,11 +115,15 @@ function parseSong(value: unknown): SongDetails | null {
     .filter((name): name is string => Boolean(name))
     .join(" / ");
 
+  const coverUrl = readString(asRecord(song.al).picUrl)
+    ?? readString(asRecord(song.album).picUrl);
+
   return {
     id,
     name: readString(song.name) ?? `歌曲 ${id}`,
     artist: artist || "未知歌手",
     durationMs: Math.max(0, readNumber(song.dt) ?? readNumber(song.duration) ?? 0),
+    ...(coverUrl ? { coverUrl } : {}),
   };
 }
 
@@ -284,9 +336,10 @@ export class NeteaseClient {
       response = await fetch(url, {
         method: "GET",
         headers: {
-          cookie: this.cookie,
+          cookie: realtimeTokenCookie(this.cookie),
           accept: "application/json",
-          "user-agent": "Mozilla/5.0 CoveBridge/0.1",
+          "accept-language": "zh-CN,zh;q=0.9",
+          "user-agent": REALTIME_TOKEN_USER_AGENT,
         },
       });
     } catch (error) {
@@ -333,6 +386,69 @@ export class NeteaseClient {
       progress: Math.max(0, readNumber(command.progress) ?? 0),
       ...(serverSeq === null ? {} : { serverSeq }),
     };
+  }
+
+  async getTogetherPlaylist(roomId: string): Promise<TogetherPlaylistState> {
+    const body = await this.call("listentogether_sync_playlist_get", { roomId });
+    const playlist = asRecord(asRecord(body.data).playlist);
+    const displayListRaw = asRecord(playlist.displayList).result;
+    const randomListRaw = asRecord(playlist.randomList).result;
+    const displayList = Array.isArray(displayListRaw)
+      ? displayListRaw.map(readString).filter((value): value is string => Boolean(value))
+      : [];
+    const randomList = Array.isArray(randomListRaw)
+      ? randomListRaw.map(readString).filter((value): value is string => Boolean(value))
+      : [];
+    const versionsRaw = Array.isArray(playlist.version) ? playlist.version : [];
+    const versions = versionsRaw.flatMap((item) => {
+      const raw = asRecord(item);
+      const userId = readString(raw.userId);
+      const version = readNumber(raw.version);
+      return userId && version !== null ? [{ userId, version }] : [];
+    });
+    return {
+      displayList,
+      randomList,
+      playMode: readString(playlist.playMode),
+      versions,
+    };
+  }
+
+  async replaceTogetherPlaylist(input: {
+    roomId: string;
+    userId: string;
+    version: number;
+    displayList: string[];
+    randomList: string[];
+  }): Promise<void> {
+    await this.call("listentogether_sync_list_command", {
+      roomId: input.roomId,
+      commandType: "REPLACE",
+      userId: input.userId,
+      version: input.version,
+      displayList: input.displayList.join(","),
+      randomList: input.randomList.join(","),
+    });
+  }
+
+  async reportPlaybackCommand(input: {
+    roomId: string;
+    commandType: "PLAY" | "PAUSE" | "GOTO";
+    progress: number;
+    playStatus: "PLAY" | "PAUSE";
+    formerSongId: string;
+    targetSongId: string;
+    clientSeq: number;
+  }): Promise<void> {
+    await this.call("listentogether_play_command", {
+      roomId: input.roomId,
+      commandType: input.commandType,
+      progress: Math.max(0, Math.floor(input.progress)),
+      playStatus: input.playStatus,
+      formerSongId: input.formerSongId,
+      targetSongId: input.targetSongId,
+      clientSeq: input.clientSeq,
+    });
   }
 
   async getSongDetails(songId: string): Promise<SongDetails> {

@@ -249,3 +249,24 @@ test("keeps the anchor for repeated command tuples without serverSeq", () => {
   assert.equal(state.progressMs, 11_000);
   assert.equal(state.observedAt, new Date(1000).toISOString());
 });
+
+test("exposes the cached lyric timeline and clears it with the song", () => {
+  const store = new PlaybackStateStore();
+  store.enterRoom("room");
+  store.updateSong(song("one"));
+  store.updateLyrics("one", lyrics("[00:01]第一句\n[00:03]第二句"));
+
+  assert.deepEqual(store.getLyricsState(), {
+    songId: "one",
+    lines: [
+      { timeMs: 1000, text: "第一句" },
+      { timeMs: 3000, text: "第二句" },
+    ],
+  });
+
+  store.updateSong(song("two"));
+  assert.deepEqual(store.getLyricsState(), {
+    songId: "two",
+    lines: [],
+  });
+});

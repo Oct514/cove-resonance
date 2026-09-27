@@ -7,6 +7,7 @@ const songSchema = z.object({
   name: z.string(),
   artist: z.string(),
   durationMs: z.number(),
+  coverUrl: z.string().optional(),
 });
 
 const playlistSchema = z.object({

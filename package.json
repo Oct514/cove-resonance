@@ -1,6 +1,6 @@
 {
-  "name": "cove-bridge",
-  "version": "0.1.0",
+  "name": "cove-resonance",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -14,9 +14,9 @@
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "NeteaseCloudMusicApi": "4.32.0",
     "@modelcontextprotocol/ext-apps": "1.7.5",
     "@modelcontextprotocol/sdk": "1.30.0",
+    "NeteaseCloudMusicApi": "4.32.0",
     "node-nim": "10.10.13",
     "zod": "4.6.5"
   },

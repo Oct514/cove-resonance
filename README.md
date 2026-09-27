@@ -72,7 +72,7 @@ ChatGPT 里的 Cove
 
 现在已经可以对换歌、暂停和继续播放做出响应。
 
-播放事件的 **NIM realtime 解码也已经跑通**；目前还在把 realtime 事件进一步升级成播放状态的主数据源，所以这一部分仍会继续优化。
+播放状态现在已经以 **NIM realtime 为主数据源**：realtime 连接正常时，PLAY / PAUSE / GOTO / PROGRESS 会直接更新当前状态；HTTP 主要负责房间生命周期、低频 reconcile 和断线 fallback。旧的 `serverSeq` 事件会被丢弃，避免过期状态倒灌。
 
 ### 读整首歌词，也知道现在唱到哪
 
@@ -97,6 +97,19 @@ ChatGPT 里的 Cove
 > “我们现在听到哪一句了”
 
 这两件事。
+
+### 我也可以控制一起听的播放和队列
+
+现在除了“知道在听什么”，我也可以对当前一起听房间执行受确认的播放控制：
+
+- 暂停 / 继续播放；
+- 切到当前 `displayList` 里的指定歌曲；
+- 播放下一首；
+- 把一首歌移动或插入到当前歌曲之后。
+
+这里不会把一次 HTTP 上报当成“控制成功”。播放控制必须等到匹配的 NIM realtime 回执，队列修改则会重新读取 Together playlist，确认歌曲位置和版本都符合预期后才返回成功。
+
+如果目标歌曲不在当前 `displayList`，GOTO 会直接拒绝，并要求先加入队列，避免出现“系统说切了，但手机其实没切”的假成功。
 
 ### 网易云一起听聊天室双向聊天
 
@@ -188,6 +201,10 @@ ChatGPT
 - 网易云聊天室实时收消息；
 - ChatGPT → 网易云聊天室回复；
 - 换歌、暂停、继续播放事件响应；
+- NIM realtime 作为当前播放状态的主数据源，HTTP 作为 reconcile / fallback；
+- 暂停、继续、GOTO、NEXT 播放控制，并等待 realtime 确认；
+- `ENQUEUE_NEXT` 队列修改，并通过 playlist 回读确认；
+- GOTO 对 `displayList` 外歌曲的假成功保护；
 - 当前歌曲 / 播放进度读取；
 - 整首歌词隐藏上下文；
 - 当前附近歌词读取；
@@ -195,7 +212,9 @@ ChatGPT
 - 回复防重复与中断后续发；
 - Conversation / State 两类事件的基本处理；
 - 最基础 Listener 轮询；
-- SSE wake、短期单次 Listener session、EventSource Listener。
+- SSE wake、短期单次 Listener session、EventSource Listener；
+- Host 人工确认兼容：取消 `ui/message` 后事件进入 terminal dismissed，不会反复复活；
+- 旧 `/mcp` 入口保持兼容，同时提供隔离的 `/mcp/music` Music profile。
 
 ### 已经实现，但还在继续稳定性验收
 
@@ -204,7 +223,6 @@ ChatGPT
 
 ### 接下来想继续做
 
-- 让 NIM realtime playback 成为播放状态的主数据源；
 - 把当前内存队列换成 SQLite 持久化；
 - Bridge 重启后也能恢复未完成的消息和回复；
 - Listener watchdog / 自动恢复；
@@ -285,6 +303,8 @@ npm start
 ```
 
 更完整的 HTTPS、systemd、MCP 接入和第一次双向测试步骤都在部署教程里。
+
+现有部署继续使用 `/mcp` 即可；新部署如果只需要网易云能力，推荐连接 `/mcp/music`。两者都保留相同的 Music V2 工具面，`/mcp` 作为向后兼容入口继续可用。
 
 ---
 

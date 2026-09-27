@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { decodeRealtimePlaybackEvent, NeteaseRealtimeTransport } from "../src/netease/realtimeTransport.js";
+import { buildPlaybackDiagnostic, decodeRealtimePlaybackEvent, NeteaseRealtimeTransport } from "../src/netease/realtimeTransport.js";
 
 test("decodes event_type=20000 config string playback event", () => {
   const event = decodeRealtimePlaybackEvent({
@@ -81,4 +81,71 @@ test("realtime status never contains credentials", () => {
   assert.equal("token" in status, false);
   assert.equal("cookie" in status, false);
   assert.equal("addresses" in status, false);
+});
+
+test("playback diagnostic only exposes whitelisted protocol fields", () => {
+  const diagnostic = buildPlaybackDiagnostic({
+    msg_type_: 100,
+    sub_type_: 7,
+    from_id_: "sensitive-account-1234",
+    client_msg_id_: "secret-message-abcdef",
+    msg_attach_: JSON.stringify({
+      event_type: 20_000,
+      config: JSON.stringify({
+        commandType: "PAUSE",
+        targetSongId: "42",
+        progress: 1234,
+        playStatus: "PAUSE",
+        serverSeq: 9,
+        token: "must-not-leak",
+      }),
+      cookie: "must-not-leak",
+    }),
+    msg_setting_: {
+      ext_: JSON.stringify({
+        appName: "music",
+        clientExt: {
+          bizType: "listenTogether",
+          ltType: "FRIEND",
+          roomId: "room",
+          auth: "must-not-leak",
+        },
+      }),
+    },
+  });
+
+  assert.ok(diagnostic);
+  const serialized = JSON.stringify(diagnostic);
+  assert.match(serialized, /PAUSE/);
+  assert.match(serialized, /listenTogether/);
+  assert.doesNotMatch(serialized, /must-not-leak/);
+  assert.doesNotMatch(serialized, /sensitive-account/);
+  assert.doesNotMatch(serialized, /secret-message/);
+});
+
+test("decodes playback clientSeq and senderId for outbound confirmation", () => {
+  const event = decodeRealtimePlaybackEvent({
+    from_id_: "cove-account",
+    msg_attach_: JSON.stringify({
+      content: {
+        type: 20_000,
+        bizType: 3,
+        content: {
+          serverSeq: 123,
+          roomId: "room",
+          commandType: "PAUSE",
+          formerSongId: "42",
+          targetSongId: "42",
+          progress: 7654,
+          playStatus: "PAUSE",
+          clientSeq: 8,
+        },
+      },
+    }),
+  }, 999);
+
+  assert.equal(event?.clientSeq, 8);
+  assert.equal(event?.senderId, "cove-account");
+  assert.equal(event?.serverSeq, 123);
+  assert.equal(event?.commandType, "PAUSE");
 });

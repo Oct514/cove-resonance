@@ -43,6 +43,31 @@ test("failed delivery can be released and retried", () => {
   assert.equal(queue.reserveNext()?.id, "evt-2");
 });
 
+test("dismissed required event becomes terminal and releases backpressure", () => {
+  const queue = new InMemoryEventQueue();
+  queue.enqueue({
+    ...event("evt-dismiss"),
+    source: "netease.chatroom",
+    replyRoute: "netease.chatroom",
+    replyPolicy: "required",
+  });
+  queue.enqueue({
+    ...event("evt-after-dismiss"),
+    source: "netease.chatroom",
+    replyRoute: "netease.chatroom",
+    replyPolicy: "required",
+  });
+
+  assert.equal(queue.reserveNext()?.id, "evt-dismiss");
+  queue.dismiss("evt-dismiss");
+  assert.equal(queue.getOutstandingRequiredReplyEvent(), null);
+  assert.deepEqual(
+    queue.claimReply("evt-dismiss", "late-reply"),
+    { state: "already_completed", sentCount: 0 },
+  );
+  assert.equal(queue.reserveNext()?.id, "evt-after-dismiss");
+});
+
 test("widget is idle by default and initializes MCP Apps bridge", () => {
   const html = buildListenerHtml();
   assert.match(html, /尚未监听/);
@@ -54,6 +79,10 @@ test("widget is idle by default and initializes MCP Apps bridge", () => {
   assert.match(html, /new EventSource\(streamUrl\.toString\(\)\)/);
   assert.match(html, /FALLBACK_POLL_MS = 60000/);
   assert.match(html, /cove-bridge-dispatched-v1/);
+  assert.match(html, /cove-bridge-pending-dismissals-v1/);
+  assert.match(html, /requestHumanDecision\('ui\/message'/);
+  assert.match(html, /cove_bridge_dismissed/);
+  assert.doesNotMatch(html, /await request\('ui\/message'/);
   assert.match(html, /不会重复显示/);
   const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
   assert.ok(script);
@@ -218,4 +247,32 @@ test("releasing an old reserved state event does not replay it over a newer stat
 
   assert.equal(queue.getEvent("state-old"), null);
   assert.equal(queue.reserveNext()?.id, "state-new");
+});
+
+
+test("profile filters isolate pending events and required-reply backpressure", () => {
+  const queue = new InMemoryEventQueue();
+  const musicFilter = (item: BridgeEvent) => item.source.startsWith("netease.");
+  const spicyFilter = (item: BridgeEvent) => item.source === "spicy-monopoly-web";
+  const coreFilter = (item: BridgeEvent) => !musicFilter(item) && !spicyFilter(item);
+
+  queue.enqueue({
+    ...event("music-required"),
+    source: "netease.chatroom",
+    replyRoute: "netease.chatroom",
+    replyPolicy: "required",
+  });
+  queue.enqueue({ ...event("spicy-turn"), source: "spicy-monopoly-web" });
+  queue.enqueue({ ...event("core-event"), source: "telegram.test" });
+
+  assert.equal(queue.reserveNext(musicFilter)?.id, "music-required");
+  assert.equal(queue.getOutstandingRequiredReplyEvent(musicFilter)?.id, "music-required");
+
+  // A required music reply must not block the independent game view.
+  assert.equal(queue.reserveNext(spicyFilter)?.id, "spicy-turn");
+  assert.equal(queue.reserveNext(coreFilter)?.id, "core-event");
+
+  assert.equal(queue.reserveNext(musicFilter), null);
+  assert.equal(queue.reserveNext(spicyFilter), null);
+  assert.equal(queue.reserveNext(coreFilter), null);
 });

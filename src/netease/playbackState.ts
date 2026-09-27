@@ -1,4 +1,4 @@
-import { findLyricWindow, parseLrc, type LyricTimeline, type LyricWindow } from "./lyrics.js";
+import { findLyricWindow, parseLrc, type LyricLine, type LyricTimeline, type LyricWindow } from "./lyrics.js";
 import type { PlaybackSnapshot, RawLyrics, SongDetails } from "./types.js";
 
 export type CurrentPlaybackState = {
@@ -12,6 +12,11 @@ export type CurrentPlaybackState = {
   lyric?: LyricWindow;
   observedAt: string | null;
   stateUpdatedAt: string;
+};
+
+export type CurrentLyricsState = {
+  songId: string | null;
+  lines: LyricLine[];
 };
 
 export type PlaybackStateSink = {
@@ -109,6 +114,15 @@ export class PlaybackStateStore implements PlaybackStateSink {
         ? new Date(this.snapshot.observedAtMs).toISOString()
         : null,
       stateUpdatedAt: new Date(this.stateUpdatedAtMs).toISOString(),
+    };
+  }
+
+  getLyricsState(): CurrentLyricsState {
+    return {
+      songId: this.song?.id ?? null,
+      lines: this.lyrics
+        ? this.lyrics.lines.map((line) => ({ timeMs: line.timeMs, text: line.text }))
+        : [],
     };
   }
 
