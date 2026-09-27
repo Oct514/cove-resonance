@@ -1,6 +1,6 @@
-# Cove Bridge 从零部署教程
+# Cove Resonance 从零部署教程
 
-这份教程面向第一次部署 Cove Bridge 的人。目标是完成下面这一条链：
+这份教程面向第一次部署 Cove Resonance 的人。目标是完成下面这一条链：
 
 ```text
 网易云一起听 ChatRoom
@@ -46,6 +46,9 @@ Worker 负责网易云「一起听」侧：
 - 收取房间文本；
 - 发送回复；
 - 读取当前歌曲、播放状态和歌词；
+- 以 NIM realtime 为播放状态主数据源，并在断线时回退到 HTTP reconcile；
+- 执行 PAUSE / PLAY / GOTO / NEXT，并等待 realtime 确认；
+- 修改 Together `displayList`，并通过 playlist 回读确认队列变更；
 - 为模型补充完整歌词上下文。
 
 ---
@@ -199,11 +202,14 @@ bridge.example.com {
 }
 ```
 
-然后 MCP 地址就是：
+然后有两个兼容入口：
 
 ```text
 https://bridge.example.com/mcp
+https://bridge.example.com/mcp/music
 ```
+
+`/mcp` 是旧版兼容入口，保留完整 Music V2 工具面；新部署如果只使用网易云能力，推荐 `/mcp/music`，它只消费 `netease.*` 事件。
 
 SSE 地址由 Bridge 自动给 Widget：
 
@@ -221,16 +227,16 @@ SSE 不直接携带聊天正文，只发送 wake 信号。
 
 ```ini
 [Unit]
-Description=Cove Bridge
+Description=Cove Resonance
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=cove
-WorkingDirectory=/opt/cove-bridge
-EnvironmentFile=/opt/cove-bridge/.env
-ExecStart=/usr/bin/node /opt/cove-bridge/dist/src/server.js
+WorkingDirectory=/opt/cove-resonance
+EnvironmentFile=/opt/cove-resonance/.env
+ExecStart=/usr/bin/node /opt/cove-resonance/dist/src/server.js
 Restart=always
 RestartSec=5
 
@@ -242,27 +248,33 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now cove-bridge
-sudo systemctl status cove-bridge
+sudo systemctl enable --now cove-resonance
+sudo systemctl status cove-resonance
 ```
 
 查看日志：
 
 ```bash
-journalctl -u cove-bridge -f
+journalctl -u cove-resonance -f
 ```
 
 ---
 
 ## 8. 在 ChatGPT 中连接
 
-在支持 MCP Apps 的 ChatGPT 环境中添加你的 MCP server：
+在支持 MCP Apps 的 ChatGPT 环境中添加你的 MCP server。新部署推荐：
+
+```text
+https://bridge.example.com/mcp/music
+```
+
+已有部署继续使用下面这个旧入口也完全兼容：
 
 ```text
 https://bridge.example.com/mcp
 ```
 
-然后在目标对话里挂载 Cove Bridge。
+然后在目标对话里挂载 Cove Resonance。
 
 Bridge Widget 默认是静止状态，不会自动监听。
 
@@ -307,6 +319,10 @@ Listener
   ↓ ui/message
 ChatGPT 当前对话
 ```
+
+不同 ChatGPT Host 对 `ui/message` 的交互可能不同：有的 Host 会直接投递，有的 Host 会要求用户确认。这个差异属于 Host 能力，不是 Bridge 协议本身。
+
+如果 Host 已经把 `ui/message` 交给用户确认，而用户选择取消，Listener 会调用 `cove_bridge_dismissed`。该事件随后进入 terminal 状态，不再 release、不再复活，也不会继续占住 required-reply backpressure。
 
 如果该事件需要回复，模型应调用：
 
@@ -411,6 +427,24 @@ latest-state-wins
 
 当前播放位置应由 realtime / playback state 决定。
 
+### 播放控制为什么必须等确认
+
+Music V2 提供：
+
+```text
+netease_together_pause
+netease_together_resume
+netease_together_goto
+netease_together_next
+netease_together_enqueue_next
+```
+
+PAUSE / RESUME / GOTO 不会把“HTTP report 成功”直接当成播放成功。Bridge 会等待匹配的 NIM realtime 事件，并校验 `clientSeq`、`serverSeq`、发送者和目标歌曲。
+
+`GOTO` 只允许切到当前 Together `displayList` 中已经存在的歌曲；如果目标不在列表里，会要求先 enqueue，避免假成功。
+
+`ENQUEUE_NEXT` 修改队列后会重新读取 Together playlist，只有确认目标歌曲紧跟当前歌曲、且队列版本符合预期，才返回成功。
+
 ---
 
 ## 13. SSE 为什么只负责 wake
@@ -509,7 +543,7 @@ npm run build
 先看：
 
 ```bash
-journalctl -u cove-bridge -f
+journalctl -u cove-resonance -f
 ```
 
 正常连接应出现类似：
@@ -532,9 +566,9 @@ SQLite 持久化已经在 roadmap 中。
 
 推荐顺序：
 
-1. NIM playback realtime 成为主播放状态源；
-2. SQLite 持久化 Conversation / reply route；
-3. Listener watchdog / 自动恢复；
+1. SQLite 持久化 Conversation / reply route；
+2. Listener watchdog / 自动恢复；
+3. 更清晰的 multi-listener 语义；
 4. 单机一体化 VPS 部署；
 5. 更通用的外部入口适配器。
 

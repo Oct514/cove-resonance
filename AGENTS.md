@@ -25,10 +25,15 @@ The NetEase adapter is not the architecture itself.
 2. `docs/ARCHITECTURE_FOR_AGENTS.zh-CN.md`
 3. `src/types.ts`
 4. `src/queue.ts`
-5. `src/server.ts`
-6. `src/mcp.ts`
-7. `src/listener-html.ts`
-8. adapter-specific files only after the core is understood
+5. `src/bridge/events.ts`
+6. `src/bridge/registerTools.ts`
+7. `src/bridge/registerApp.ts`
+8. `src/profiles.ts`
+9. `src/server.ts`
+10. `src/mcp.ts`
+11. `src/listener-html.ts`
+12. `src/netease/registerTogetherTools.ts`
+13. adapter-specific files only after the core is understood
 
 ## Core invariants
 
@@ -40,10 +45,12 @@ Do not violate these without an explicit design decision.
 4. Conversation events are FIFO and are not coalesced.
 5. State events use latest-state-wins per `stateKey`.
 6. Required routed replies create backpressure until reply completion.
-7. Once the host accepted `ui/message`, ACK failure must not cause redispatch.
-8. Ingress adapters deduplicate on provider message identity.
-9. Reply delivery is idempotent through fingerprint + `sentCount` + completion state.
-10. `replyRoute` belongs to the event. The model must not invent a route.
+7. Once `ui/message` has been handed to the host, failures must not blindly release and redispatch the event.
+8. If a human-confirmed host dismisses `ui/message`, mark the event terminal with `cove_bridge_dismissed`; do not resurrect it and do not leave required-reply backpressure locked.
+9. Ingress adapters deduplicate on provider message identity.
+10. Reply delivery is idempotent through fingerprint + `sentCount` + completion state.
+11. `replyRoute` belongs to the event. The model must not invent a route.
+12. A playback control is not successful merely because an HTTP report returned successfully; wait for authoritative realtime or playlist confirmation.
 
 ## Layer boundaries
 
@@ -71,9 +78,15 @@ Verified:
 - reply dedupe/resume
 - full-song lyric context
 - playback event decoding
+- NIM playback realtime as the primary playback-state source, with HTTP reconcile/fallback
+- realtime-confirmed PAUSE / RESUME / GOTO / NEXT controls
+- playlist-confirmed `ENQUEUE_NEXT` queue mutation
+- rejection of GOTO targets outside the current `displayList`
 - public SSE stream/session primitive
+- human-confirmed `ui/message` dismissal as a terminal event
 - source message dedupe
 - listener event dedupe
+- backward-compatible `/mcp` plus Music-scoped `/mcp/music`
 
 Still under stability validation:
 
@@ -82,7 +95,6 @@ Still under stability validation:
 
 Roadmap, not completed:
 
-- NIM playback realtime as primary playback state
 - SQLite persistence
 - crash-safe reply journal
 - unattended listener watchdog
