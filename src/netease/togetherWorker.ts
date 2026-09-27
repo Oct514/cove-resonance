@@ -2,7 +2,13 @@ import { NeteaseApiError, NeteaseClient, type AccountProfile } from "./client.js
 import { collectContactUserIds, parseLatestInvite } from "./inviteParser.js";
 import { buildFullLyricsModelContext, countAvailableLyricPayloads } from "./lyricsContext.js";
 import type { PlaybackStateSink } from "./playbackState.js";
-import { NeteaseRealtimeTransport, type RealtimeChatRoomMessage, type RealtimeChatSendResult, type RealtimeTransportStatus } from "./realtimeTransport.js";
+import {
+  NeteaseRealtimeTransport,
+  type RealtimeChatRoomMessage,
+  type RealtimeChatSendResult,
+  type RealtimePlaybackEvent,
+  type RealtimeTransportStatus,
+} from "./realtimeTransport.js";
 import type {
   PlayingState,
   SongDetails,
@@ -18,8 +24,47 @@ type TogetherWorkerOptions = {
   inviterUid?: string;
   pollIntervalMs?: number;
   heartbeatIntervalMs?: number;
+  playbackReconcileIntervalMs?: number;
+  playbackControlTimeoutMs?: number;
   onEvent: EventSink;
   stateSink?: PlaybackStateSink;
+};
+
+export type PlaybackControlResult = {
+  ok: true;
+  confirmed: true;
+  commandType: "PLAY" | "PAUSE" | "GOTO";
+  roomId: string;
+  songId: string;
+  playStatus: "PLAY" | "PAUSE";
+  progressMs: number;
+  clientSeq: number;
+  serverSeq: number;
+  confirmedAt: string;
+};
+
+export type QueueMutationResult = {
+  ok: true;
+  confirmed: true;
+  action: "ENQUEUE_NEXT";
+  roomId: string;
+  songId: string;
+  afterSongId: string;
+  version: number;
+  confirmedAt: string;
+};
+
+type PendingPlaybackControl = {
+  commandType: "PLAY" | "PAUSE" | "GOTO";
+  roomId: string;
+  songId: string;
+  clientSeq: number;
+  senderId: string;
+  expectedPlayStatus: "PLAY" | "PAUSE";
+  baselineServerSeq: number | null;
+  timeout: ReturnType<typeof setTimeout>;
+  resolve: (result: PlaybackControlResult) => void;
+  reject: (error: Error) => void;
 };
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -37,6 +82,14 @@ export class TogetherWorker {
   private joinedPending = false;
   private lastHeartbeatAt = 0;
   private lastRealtimeAttemptAt = 0;
+  private lastPlaybackServerSeq: number | null = null;
+  private lastPlaybackReconcileAt = 0;
+  private latestPlaying: PlayingState | null = null;
+  private latestPlaybackObservedAtMs = 0;
+  private nextPlaybackClientSeq = 1;
+  private pendingPlaybackControl: PendingPlaybackControl | null = null;
+  private queueMutationPending = false;
+  private playbackHandlingTail: Promise<void> = Promise.resolve();
   private errorStreak = 0;
   private accountProfile: AccountProfile | null = null;
   private currentLyricsModelContext: string | null = null;
@@ -44,9 +97,15 @@ export class TogetherWorker {
 
   constructor(private readonly options: TogetherWorkerOptions) {
     this.client = new NeteaseClient(options.cookie);
-    this.realtime = new NeteaseRealtimeTransport(options.enabled, (message) => {
-      this.handleRealtimeChatMessage(message);
-    });
+    this.realtime = new NeteaseRealtimeTransport(
+      options.enabled,
+      (message) => {
+        this.handleRealtimeChatMessage(message);
+      },
+      (event) => {
+        this.handleRealtimePlaybackEvent(event);
+      },
+    );
     this.status = {
       enabled: options.enabled,
       phase: options.enabled ? "starting" : "disabled",
@@ -70,6 +129,157 @@ export class TogetherWorker {
 
   async sendChatRoomText(text: string): Promise<RealtimeChatSendResult> {
     return await this.realtime.sendChatRoomText(text);
+  }
+
+  async pausePlayback(): Promise<PlaybackControlResult> {
+    return await this.controlPlayback("PAUSE");
+  }
+
+  async resumePlayback(): Promise<PlaybackControlResult> {
+    return await this.controlPlayback("PLAY");
+  }
+
+  async gotoPlayback(songId: string): Promise<PlaybackControlResult> {
+    const targetSongId = songId.trim();
+    if (!/^\d+$/.test(targetSongId)) {
+      throw new Error("NetEase target songId must be numeric.");
+    }
+    if (!this.roomId) {
+      throw new Error("NetEase Listen Together is not currently in a room.");
+    }
+
+    const playlist = await this.client.getTogetherPlaylist(this.roomId);
+    if (!playlist.displayList.includes(targetSongId)) {
+      throw new Error(
+        `NetEase GOTO target is not in the current Together displayList: ${targetSongId}. Enqueue it before GOTO.`,
+      );
+    }
+
+    return await this.controlPlayback("GOTO", targetSongId);
+  }
+
+  async nextPlayback(): Promise<PlaybackControlResult> {
+    if (!this.roomId) throw new Error("NetEase Listen Together is not currently in a room.");
+    const currentSongId = this.latestPlaying?.songId ?? this.status.currentSong?.id ?? null;
+    if (!currentSongId) throw new Error("NetEase current playback state is unavailable.");
+
+    const playlist = await this.client.getTogetherPlaylist(this.roomId);
+    if (playlist.playMode !== "ORDER_LOOP") {
+      throw new Error(`Unsupported NetEase Together playMode for NEXT: ${playlist.playMode ?? "unknown"}`);
+    }
+    if (!playlist.displayList.length) {
+      throw new Error("NetEase Together displayList is empty.");
+    }
+
+    const currentIndex = playlist.displayList.indexOf(currentSongId);
+    if (currentIndex < 0) {
+      throw new Error(`Current NetEase song is missing from displayList: ${currentSongId}`);
+    }
+
+    const stillCurrentSongId = this.latestPlaying?.songId ?? this.status.currentSong?.id ?? null;
+    if (stillCurrentSongId !== currentSongId) {
+      throw new Error("NetEase playback changed while resolving NEXT; retry the command.");
+    }
+
+    const targetSongId = playlist.displayList[(currentIndex + 1) % playlist.displayList.length];
+    return await this.gotoPlayback(targetSongId);
+  }
+
+  async enqueueNext(songId: string): Promise<QueueMutationResult> {
+    const targetSongId = songId.trim();
+    if (!/^\d+$/.test(targetSongId)) {
+      throw new Error("NetEase target songId must be numeric.");
+    }
+    if (this.queueMutationPending) {
+      throw new Error("NetEase queue mutation already pending.");
+    }
+    if (!this.roomId) throw new Error("NetEase Listen Together is not currently in a room.");
+
+    const currentSongId = this.latestPlaying?.songId ?? this.status.currentSong?.id ?? null;
+    if (!currentSongId) throw new Error("NetEase current playback state is unavailable.");
+    if (targetSongId === currentSongId) {
+      throw new Error("NetEase ENQUEUE_NEXT target cannot be the currently playing song.");
+    }
+
+    const accountId = this.status.accountId;
+    if (!accountId) throw new Error("NetEase account identity is unavailable.");
+
+    this.queueMutationPending = true;
+    try {
+      const roomId = this.roomId;
+      const playlist = await this.client.getTogetherPlaylist(roomId);
+      if (playlist.playMode !== "ORDER_LOOP") {
+        throw new Error(`Unsupported NetEase Together playMode for ENQUEUE_NEXT: ${playlist.playMode ?? "unknown"}`);
+      }
+      if (!playlist.displayList.length) {
+        throw new Error("NetEase Together displayList is empty.");
+      }
+
+      const currentIndex = playlist.displayList.indexOf(currentSongId);
+      if (currentIndex < 0) {
+        throw new Error(`Current NetEase song is missing from displayList: ${currentSongId}`);
+      }
+
+      const ownVersion = playlist.versions.find((entry) => entry.userId === accountId)?.version ?? 0;
+      const nextVersion = ownVersion + 1;
+      const nextDisplayList = playlist.displayList.filter((id) => id !== targetSongId);
+      const currentIndexAfterRemoval = nextDisplayList.indexOf(currentSongId);
+      if (currentIndexAfterRemoval < 0) {
+        throw new Error(`Current NetEase song disappeared while building queue: ${currentSongId}`);
+      }
+      nextDisplayList.splice(currentIndexAfterRemoval + 1, 0, targetSongId);
+
+      const stillCurrentSongId = this.latestPlaying?.songId ?? this.status.currentSong?.id ?? null;
+      if (stillCurrentSongId !== currentSongId) {
+        throw new Error("NetEase playback changed while resolving ENQUEUE_NEXT; retry the command.");
+      }
+
+      await this.client.replaceTogetherPlaylist({
+        roomId,
+        userId: accountId,
+        version: nextVersion,
+        displayList: nextDisplayList,
+        randomList: playlist.randomList,
+      });
+      console.log(
+        `NetEase queue mutation reported: action=ENQUEUE_NEXT afterSongId=${currentSongId} songId=${targetSongId} version=${nextVersion}`,
+      );
+
+      const timeoutMs = this.options.playbackControlTimeoutMs ?? 8_000;
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        await sleep(250);
+        const confirmed = await this.client.getTogetherPlaylist(roomId);
+        const confirmedCurrentIndex = confirmed.displayList.indexOf(currentSongId);
+        const confirmedNext = confirmedCurrentIndex >= 0
+          ? confirmed.displayList[(confirmedCurrentIndex + 1) % confirmed.displayList.length]
+          : null;
+        const confirmedVersion = confirmed.versions.find(
+          (entry) => entry.userId === accountId,
+        )?.version ?? 0;
+        if (confirmedNext === targetSongId && confirmedVersion >= nextVersion) {
+          console.log(
+            `NetEase queue mutation confirmed: action=ENQUEUE_NEXT afterSongId=${currentSongId} songId=${targetSongId} version=${confirmedVersion}`,
+          );
+          return {
+            ok: true,
+            confirmed: true,
+            action: "ENQUEUE_NEXT",
+            roomId,
+            songId: targetSongId,
+            afterSongId: currentSongId,
+            version: confirmedVersion,
+            confirmedAt: new Date().toISOString(),
+          };
+        }
+      }
+
+      throw new Error(
+        `NetEase ENQUEUE_NEXT timed out waiting for playlist confirmation: target=${targetSongId} version=${nextVersion}`,
+      );
+    } finally {
+      this.queueMutationPending = false;
+    }
   }
 
   start(): void {
@@ -138,16 +348,19 @@ export class TogetherWorker {
 
     if (!this.roomId) return;
     this.status.phase = "listening";
-    const playing = await this.client.getPlaying(this.roomId);
-    this.updateState((sink) => sink.updatePlayback({
-      songId: playing.songId,
-      playStatus: playing.playStatus,
-      progressMs: playing.progress,
-      observedAtMs: Date.now(),
-      ...(playing.serverSeq === undefined ? {} : { serverSeq: playing.serverSeq }),
-    }));
-    await this.maybeHeartbeat(playing);
-    await this.handlePlaying(playing);
+
+    const now = Date.now();
+    const realtimeConnected = this.realtime.getStatus().connected;
+    let playbackHandling = Promise.resolve();
+    if (this.shouldReconcilePlayback(now, realtimeConnected)) {
+      const playing = await this.client.getPlaying(this.roomId);
+      const observedAtMs = Date.now();
+      this.lastPlaybackReconcileAt = observedAtMs;
+      playbackHandling = this.applyPlayback(playing, observedAtMs, "http");
+    }
+
+    await this.maybeHeartbeat();
+    await playbackHandling;
   }
 
   private async ensureRealtime(roomId: string, chatRoomId: string): Promise<void> {
@@ -231,7 +444,11 @@ export class TogetherWorker {
 
   private enterRoom(roomId: string, chatRoomId: string | null = null): void {
     const changedRoom = this.roomId !== roomId;
-    if (changedRoom) void this.realtime.disconnect();
+    if (changedRoom) {
+      this.rejectPendingPlaybackControl("NetEase Listen Together room changed before playback control confirmation.");
+      void this.realtime.disconnect();
+      this.nextPlaybackClientSeq = 1;
+    }
     this.roomId = roomId;
     this.chatRoomId = chatRoomId;
     this.previousSongId = null;
@@ -240,6 +457,10 @@ export class TogetherWorker {
     this.joinedPending = true;
     this.lastHeartbeatAt = 0;
     this.lastRealtimeAttemptAt = 0;
+    this.lastPlaybackServerSeq = null;
+    this.lastPlaybackReconcileAt = 0;
+    this.latestPlaying = null;
+    this.latestPlaybackObservedAtMs = 0;
     this.status.roomId = roomId;
     this.status.currentSong = null;
     this.status.playStatus = "UNKNOWN";
@@ -249,6 +470,7 @@ export class TogetherWorker {
 
   private leaveRoom(message: string): void {
     const wasInRoom = Boolean(this.roomId);
+    this.rejectPendingPlaybackControl("NetEase Listen Together ended before playback control confirmation.");
     this.roomId = null;
     this.chatRoomId = null;
     this.previousSongId = null;
@@ -257,6 +479,10 @@ export class TogetherWorker {
     this.joinedPending = false;
     this.lastHeartbeatAt = 0;
     this.lastRealtimeAttemptAt = 0;
+    this.lastPlaybackServerSeq = null;
+    this.lastPlaybackReconcileAt = 0;
+    this.latestPlaying = null;
+    this.latestPlaybackObservedAtMs = 0;
     this.status.roomId = null;
     this.status.currentSong = null;
     this.status.playStatus = "UNKNOWN";
@@ -266,18 +492,235 @@ export class TogetherWorker {
     if (wasInRoom) this.options.onEvent("netease.together", message);
   }
 
-  private async maybeHeartbeat(playing: PlayingState): Promise<void> {
-    if (!this.roomId) return;
+  private currentPlaybackProgressMs(nowMs = Date.now()): number {
+    const playing = this.latestPlaying;
+    if (!playing) return 0;
+
+    const elapsedMs = playing.playStatus === "PLAY"
+      ? Math.max(0, nowMs - this.latestPlaybackObservedAtMs)
+      : 0;
+    let progressMs = Math.max(0, playing.progress + elapsedMs);
+    const currentSong = this.status.currentSong;
+    if (currentSong && currentSong.id === playing.songId) {
+      progressMs = Math.min(progressMs, currentSong.durationMs);
+    }
+    return progressMs;
+  }
+
+  private async controlPlayback(
+    commandType: "PLAY" | "PAUSE" | "GOTO",
+    requestedTargetSongId?: string,
+  ): Promise<PlaybackControlResult> {
+    if (this.pendingPlaybackControl) {
+      throw new Error(
+        `NetEase playback control already pending: ${this.pendingPlaybackControl.commandType}`,
+      );
+    }
+    if (!this.roomId) throw new Error("NetEase Listen Together is not currently in a room.");
+
+    const realtimeStatus = this.realtime.getStatus();
+    if (!realtimeStatus.connected) {
+      throw new Error("NetEase realtime is not connected; refusing unconfirmed playback control.");
+    }
+
+    const senderId = this.status.accountId;
+    if (!senderId) throw new Error("NetEase account identity is unavailable.");
+
+    const playing = this.latestPlaying;
+    const currentSongId = playing?.songId ?? this.status.currentSong?.id ?? null;
+    if (!playing || !currentSongId) throw new Error("NetEase current playback state is unavailable.");
+
+    const targetSongId = commandType === "GOTO"
+      ? requestedTargetSongId ?? null
+      : currentSongId;
+    if (!targetSongId) throw new Error("NetEase target songId is unavailable.");
+
+    const expectedPlayStatus: "PLAY" | "PAUSE" = commandType === "PAUSE" ? "PAUSE" : "PLAY";
+    const progressMs = commandType === "GOTO" ? 0 : this.currentPlaybackProgressMs();
+    const roomId = this.roomId;
+    const clientSeq = this.nextPlaybackClientSeq++;
+    const baselineServerSeq = this.lastPlaybackServerSeq;
+    const timeoutMs = this.options.playbackControlTimeoutMs ?? 8_000;
+
+    let resolveConfirmation!: (result: PlaybackControlResult) => void;
+    let rejectConfirmation!: (error: Error) => void;
+    const confirmation = new Promise<PlaybackControlResult>((resolve, reject) => {
+      resolveConfirmation = resolve;
+      rejectConfirmation = reject;
+    });
+
+    const timeout = setTimeout(() => {
+      if (this.pendingPlaybackControl?.clientSeq !== clientSeq) return;
+      this.pendingPlaybackControl = null;
+      rejectConfirmation(new Error(
+        `NetEase playback control timed out waiting for realtime confirmation: ${commandType} clientSeq=${clientSeq}`,
+      ));
+    }, timeoutMs);
+
+    this.pendingPlaybackControl = {
+      commandType,
+      roomId,
+      songId: targetSongId,
+      clientSeq,
+      senderId,
+      expectedPlayStatus,
+      baselineServerSeq,
+      timeout,
+      resolve: resolveConfirmation,
+      reject: rejectConfirmation,
+    };
+
+    try {
+      await this.client.reportPlaybackCommand({
+        roomId,
+        commandType,
+        progress: progressMs,
+        playStatus: expectedPlayStatus,
+        formerSongId: currentSongId,
+        targetSongId,
+        clientSeq,
+      });
+      console.log(
+        `NetEase playback control reported: command=${commandType} formerSongId=${currentSongId} targetSongId=${targetSongId} progressMs=${Math.floor(progressMs)} clientSeq=${clientSeq}`,
+      );
+    } catch (error) {
+      if (this.pendingPlaybackControl?.clientSeq === clientSeq) {
+        clearTimeout(this.pendingPlaybackControl.timeout);
+        this.pendingPlaybackControl = null;
+      }
+      throw error;
+    }
+
+    return await confirmation;
+  }
+
+  private confirmPendingPlaybackControl(event: RealtimePlaybackEvent): void {
+    const pending = this.pendingPlaybackControl;
+    if (!pending) return;
+    if (event.clientSeq !== pending.clientSeq) return;
+    if (event.senderId !== pending.senderId) return;
+    if (event.commandType !== pending.commandType) return;
+    if (event.songId !== pending.songId) return;
+    if (event.playStatus !== pending.expectedPlayStatus) return;
+    if (event.serverSeq === null) return;
+    if (
+      pending.baselineServerSeq !== null
+      && event.serverSeq <= pending.baselineServerSeq
+    ) return;
+
+    clearTimeout(pending.timeout);
+    this.pendingPlaybackControl = null;
+    const result: PlaybackControlResult = {
+      ok: true,
+      confirmed: true,
+      commandType: pending.commandType,
+      roomId: pending.roomId,
+      songId: pending.songId,
+      playStatus: event.playStatus,
+      progressMs: event.progressMs,
+      clientSeq: pending.clientSeq,
+      serverSeq: event.serverSeq,
+      confirmedAt: new Date(event.receivedAtMs).toISOString(),
+    };
+    console.log(
+      `NetEase playback control confirmed: command=${result.commandType} songId=${result.songId} clientSeq=${result.clientSeq} serverSeq=${result.serverSeq}`,
+    );
+    pending.resolve(result);
+  }
+
+  private rejectPendingPlaybackControl(message: string): void {
+    const pending = this.pendingPlaybackControl;
+    if (!pending) return;
+    clearTimeout(pending.timeout);
+    this.pendingPlaybackControl = null;
+    pending.reject(new Error(message));
+  }
+
+  private shouldReconcilePlayback(nowMs: number, realtimeConnected: boolean): boolean {
+    if (!this.latestPlaying) return true;
+    if (!realtimeConnected) return true;
+    const interval = this.options.playbackReconcileIntervalMs ?? 30_000;
+    return nowMs - this.lastPlaybackReconcileAt >= interval;
+  }
+
+  private async maybeHeartbeat(): Promise<void> {
+    const playing = this.latestPlaying;
+    if (!this.roomId || !playing) return;
+
     const interval = this.options.heartbeatIntervalMs ?? 10_000;
-    if (Date.now() - this.lastHeartbeatAt < interval) return;
+    const nowMs = Date.now();
+    if (nowMs - this.lastHeartbeatAt < interval) return;
+
+    const progressMs = this.currentPlaybackProgressMs(nowMs);
     await this.client.sendHeartbeat(
       this.roomId,
       playing.songId,
       playing.playStatus === "PLAY",
-      playing.progress,
+      progressMs,
     );
     this.lastHeartbeatAt = Date.now();
     this.status.lastHeartbeatAt = new Date(this.lastHeartbeatAt).toISOString();
+  }
+
+  private applyPlayback(
+    playing: PlayingState,
+    observedAtMs: number,
+    origin: "http" | "realtime",
+  ): Promise<void> {
+    const serverSeq = playing.serverSeq;
+    if (
+      serverSeq !== undefined
+      && this.lastPlaybackServerSeq !== null
+      && serverSeq < this.lastPlaybackServerSeq
+    ) {
+      console.log(
+        `Together stale playback ignored: origin=${origin} serverSeq=${serverSeq} latest=${this.lastPlaybackServerSeq}`,
+      );
+      return Promise.resolve();
+    }
+    if (serverSeq !== undefined) this.lastPlaybackServerSeq = serverSeq;
+
+    this.latestPlaying = { ...playing };
+    this.latestPlaybackObservedAtMs = observedAtMs;
+
+    this.updateState((sink) => sink.updatePlayback({
+      songId: playing.songId,
+      playStatus: playing.playStatus,
+      progressMs: playing.progress,
+      observedAtMs,
+      ...(serverSeq === undefined ? {} : { serverSeq }),
+    }));
+
+    const handling = this.playbackHandlingTail.then(() => this.handlePlaying(playing));
+    this.playbackHandlingTail = handling.catch(() => {});
+    return handling;
+  }
+
+  private handleRealtimePlaybackEvent(event: RealtimePlaybackEvent): void {
+    if (!this.roomId) return;
+
+    const knownStatus = this.status.playStatus;
+    const playStatus = event.playStatus === "UNKNOWN" && knownStatus !== "UNKNOWN"
+      ? knownStatus
+      : event.playStatus;
+    const songId = event.songId ?? this.status.currentSong?.id ?? this.previousSongId;
+    const playing: PlayingState = {
+      songId,
+      playStatus,
+      progress: event.progressMs,
+      ...(event.serverSeq === null ? {} : { serverSeq: event.serverSeq }),
+    };
+
+    void this.applyPlayback(playing, event.receivedAtMs, "realtime")
+      .then(() => {
+        this.confirmPendingPlaybackControl(event);
+      })
+      .catch((error) => {
+        const detail = error instanceof NeteaseApiError
+          ? `${error.operation}${error.code === null ? "" : ` code=${error.code}`}`
+          : error instanceof Error ? error.message : "unknown error";
+        console.error(`Together realtime playback handling failed: ${detail}`);
+      });
   }
 
   private async handlePlaying(playing: PlayingState): Promise<void> {
@@ -421,6 +864,8 @@ export function createTogetherWorker(
     inviterUid: process.env.NETEASE_INVITER_UID?.trim() || undefined,
     pollIntervalMs: parseInterval("TOGETHER_POLL_INTERVAL_MS", 4000),
     heartbeatIntervalMs: parseInterval("TOGETHER_HEARTBEAT_INTERVAL_MS", 10_000),
+    playbackReconcileIntervalMs: parseInterval("TOGETHER_PLAYBACK_RECONCILE_INTERVAL_MS", 30_000),
+    playbackControlTimeoutMs: parseInterval("TOGETHER_PLAYBACK_CONTROL_TIMEOUT_MS", 8_000),
     onEvent,
     stateSink,
   });

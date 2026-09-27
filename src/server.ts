@@ -4,84 +4,19 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { createMcpServer } from "./mcp.js";
+import { buildBridgeEvent } from "./bridge/events.js";
+export { buildBridgeEvent } from "./bridge/events.js";
+import { MCP_PATHS } from "./profiles.js";
 import { listenerWakeHub } from "./listenerWake.js";
 import { PlaybackStateStore } from "./netease/playbackState.js";
 import { createTogetherWorker } from "./netease/togetherWorker.js";
 import { InMemoryEventQueue } from "./queue.js";
-import type { BridgeEvent, BridgeStream, ReplyPolicy, ReplyRoute } from "./types.js";
 
 const PORT = Number(process.env.PORT ?? 8787);
-const MCP_PATH = "/mcp";
 const INGEST_TOKEN = process.env.BRIDGE_INGEST_TOKEN ?? "";
 const UNIX_SOCKET = process.env.BRIDGE_UNIX_SOCKET?.trim() ?? "";
 const queue = new InMemoryEventQueue();
 const playbackState = new PlaybackStateStore();
-
-function replyRoutingFor(source: string): { replyRoute?: ReplyRoute; replyPolicy?: ReplyPolicy } {
-  if (source === "netease.chatroom") {
-    return { replyRoute: "netease.chatroom", replyPolicy: "required" };
-  }
-  if (source.startsWith("netease.")) {
-    return { replyRoute: "netease.chatroom", replyPolicy: "optional" };
-  }
-  return {};
-}
-
-function streamRoutingFor(source: string): { stream: BridgeStream; stateKey?: string } {
-  if (source === "netease.chatroom") {
-    return { stream: "conversation" };
-  }
-  if (source.startsWith("netease.")) {
-    return { stream: "state", stateKey: "netease.together.presence" };
-  }
-  return { stream: "conversation" };
-}
-
-function buildBridgeEvent(
-  id: string,
-  source: string,
-  text: string,
-  createdAt = new Date().toISOString(),
-  additionalModelContext?: string,
-): BridgeEvent {
-  const routing = replyRoutingFor(source);
-  const streamRouting = streamRoutingFor(source);
-  const routeLines = routing.replyRoute
-    ? [
-        `replyRoute=${routing.replyRoute}`,
-        `replyPolicy=${routing.replyPolicy ?? "optional"}`,
-        routing.replyPolicy === "required"
-          ? "ROUTING CONTRACT (mandatory): before completing this turn, call cove_bridge_reply exactly once and put the complete user-facing reply in messages[]. A reply shown only in ChatGPT is incomplete because the user is waiting in NetEase ChatRoom. For normal conversation, default to 2-5 short natural bubbles; use one bubble only for a genuinely brief reply. Do not pack a multi-sentence reply into one bubble, and do not invent filler merely to increase the count. eventId may be omitted because the Bridge binds to the active required event. Do not use netease_together_send_message directly."
-          : "ROUTING CONTRACT (optional): if you choose to send a user-facing reaction for this event, deliver it through cove_bridge_reply using this exact eventId. If no reaction is useful, do not call the reply tool.",
-      ]
-    : [];
-
-  return {
-    id,
-    correlationId: id,
-    kind: "message",
-    source,
-    ...streamRouting,
-    ...routing,
-    createdAt,
-    visibleText: text,
-    modelContext: [
-      "This message entered through Cove Bridge.",
-      "Treat the visible text as the current foreground user message.",
-      `eventId=${id}`,
-      `correlationId=${id}`,
-      `source=${source}`,
-      `stream=${streamRouting.stream}`,
-      ...(streamRouting.stateKey ? [`stateKey=${streamRouting.stateKey}`] : []),
-      ...(streamRouting.stream === "state"
-        ? ["STATE STREAM: this event is ephemeral/latest-state oriented. Do not assume older undelivered state events will be replayed."]
-        : ["CONVERSATION STREAM: preserve ordering and complete any required reply before the next conversation turn is released."]),
-      ...routeLines,
-      ...(additionalModelContext ? [additionalModelContext] : []),
-      `createdAt=${createdAt}`,
-    ].join("\n"),
-  };
-}
 
 function enqueueTogetherEvent(
   source: string,
@@ -200,10 +135,11 @@ export function createHttpServer() {
     }
 
     const mcpMethods = new Set(["POST", "GET", "DELETE"]);
-    if (url.pathname === MCP_PATH && mcpMethods.has(req.method)) {
+    const mcpProfile = MCP_PATHS.get(url.pathname);
+    if (mcpProfile && mcpMethods.has(req.method)) {
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
-      const server = createMcpServer(queue, playbackState, togetherWorker);
+      const server = createMcpServer(queue, playbackState, togetherWorker, mcpProfile);
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
@@ -228,7 +164,7 @@ export function createHttpServer() {
 
 if (process.env.NODE_ENV !== "test") {
   createHttpServer().listen(PORT, "0.0.0.0", () => {
-    console.log(`Cove Bridge listening on http://0.0.0.0:${PORT}${MCP_PATH}`);
+    console.log("Cove Resonance listening on http://0.0.0.0:" + PORT + " (MCP: /mcp, /mcp/music)");
     togetherWorker.start();
   });
 
@@ -236,7 +172,7 @@ if (process.env.NODE_ENV !== "test") {
     if (existsSync(UNIX_SOCKET)) unlinkSync(UNIX_SOCKET);
     createHttpServer().listen(UNIX_SOCKET, () => {
       chmodSync(UNIX_SOCKET, 0o666);
-      console.log(`Cove Bridge listening on unix://${UNIX_SOCKET}${MCP_PATH}`);
+      console.log("Cove Resonance listening on unix://" + UNIX_SOCKET + " (MCP: /mcp, /mcp/music)");
     });
   }
 }

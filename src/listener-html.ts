@@ -37,9 +37,11 @@ export function buildListenerHtml(): string {
   let sseConnected = false;
   const DISPATCHED_STORAGE_KEY = 'cove-bridge-dispatched-v1';
   const PENDING_ACK_STORAGE_KEY = 'cove-bridge-pending-acks-v1';
+  const PENDING_DISMISS_STORAGE_KEY = 'cove-bridge-pending-dismissals-v1';
   const MAX_RECENT_DISPATCHED = 128;
   const recentlyDispatched = new Set();
   const pendingAcks = new Set();
+  const pendingDismissals = new Set();
 
   const statusEl = document.getElementById('status');
   const toggleEl = document.getElementById('toggle');
@@ -62,6 +64,7 @@ export function buildListenerHtml(): string {
 
   for (const id of readStoredIds(DISPATCHED_STORAGE_KEY)) recentlyDispatched.add(id);
   for (const id of readStoredIds(PENDING_ACK_STORAGE_KEY)) pendingAcks.add(id);
+  for (const id of readStoredIds(PENDING_DISMISS_STORAGE_KEY)) pendingDismissals.add(id);
 
   function rememberDispatched(eventId) {
     recentlyDispatched.delete(eventId);
@@ -84,6 +87,33 @@ export function buildListenerHtml(): string {
     writeStoredIds(PENDING_ACK_STORAGE_KEY, [...pendingAcks]);
   }
 
+  function rememberPendingDismissal(eventId) {
+    pendingDismissals.add(eventId);
+    writeStoredIds(PENDING_DISMISS_STORAGE_KEY, [...pendingDismissals]);
+  }
+
+  function forgetPendingDismissal(eventId) {
+    pendingDismissals.delete(eventId);
+    writeStoredIds(PENDING_DISMISS_STORAGE_KEY, [...pendingDismissals]);
+  }
+
+  async function flushPendingDismissals() {
+    for (const eventId of [...pendingDismissals]) {
+      try {
+        await callTool('cove_bridge_dismissed', { eventId });
+        forgetPendingDismissal(eventId);
+      } catch (error) {
+        const message = error && error.message ? error.message : String(error);
+        if (message.includes('Unknown event')) {
+          forgetPendingDismissal(eventId);
+          continue;
+        }
+        return false;
+      }
+    }
+    return true;
+  }
+
   async function flushPendingAcks() {
     for (const eventId of [...pendingAcks]) {
       try {
@@ -101,6 +131,11 @@ export function buildListenerHtml(): string {
     return true;
   }
 
+  async function flushPendingTerminals() {
+    if (!await flushPendingDismissals()) return false;
+    return await flushPendingAcks();
+  }
+
   function notify(method, params) {
     window.parent.postMessage({ jsonrpc: '2.0', method, params }, '*');
   }
@@ -115,6 +150,18 @@ export function buildListenerHtml(): string {
         if (!entry) return;
         pending.delete(id);
         reject(new Error(method + ' timed out'));
+      }, 18000);
+    });
+  }
+
+  function requestHumanDecision(method, params) {
+    const id = ++rpcId;
+    window.parent.postMessage({ jsonrpc: '2.0', id, method, params }, '*');
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      window.setTimeout(() => {
+        if (!pending.has(id)) return;
+        setStatus('等待你确认发送或取消；不会重复投递。');
       }, 18000);
     });
   }
@@ -236,10 +283,20 @@ export function buildListenerHtml(): string {
         }
       }
     });
-    await request('ui/message', {
-      role: 'user',
-      content: [{ type: 'text', text: String(event.visibleText || '') }]
-    });
+
+    // ui/message is now a human-confirmed Host operation. Once handed off,
+    // never release the event merely because the user takes longer than an
+    // ordinary RPC timeout to decide.
+    setStatus('已交给 ChatGPT，等待你确认发送或取消…');
+    try {
+      await requestHumanDecision('ui/message', {
+        role: 'user',
+        content: [{ type: 'text', text: String(event.visibleText || '') }]
+      });
+      return { outcome: 'sent' };
+    } catch (error) {
+      return { outcome: 'dismissed', error };
+    }
   }
 
   async function syncOnce() {
@@ -247,9 +304,9 @@ export function buildListenerHtml(): string {
     inFlight = true;
     let shouldContinue = false;
     try {
-      const acksFlushed = await flushPendingAcks();
-      if (!acksFlushed) {
-        setStatus('事件已显示，正在重试送达确认；不会重复显示。');
+      const terminalsFlushed = await flushPendingTerminals();
+      if (!terminalsFlushed) {
+        setStatus('事件终态正在重试确认；不会重复显示。');
         return;
       }
 
@@ -279,19 +336,33 @@ export function buildListenerHtml(): string {
       }
 
       setStatus('正在投递事件…');
+      let dispatchResult;
       try {
-        await dispatch(event);
+        dispatchResult = await dispatch(event);
       } catch (error) {
+        // Only failures before ui/message handoff are safe to retry.
         await callTool('cove_bridge_release', { eventId }).catch(() => {});
         throw error;
       }
 
-      // From this point onward the host has already accepted the visible message.
-      // Never release it back to pending if the acknowledgement RPC fails, or the
-      // same user-visible event can be dispatched again.
+      // ui/message has been handed to the Host. Persist this before terminal
+      // acknowledgement so a widget reload cannot show the same prompt again.
       rememberDispatched(eventId);
+
+      if (dispatchResult && dispatchResult.outcome === 'dismissed') {
+        rememberPendingDismissal(eventId);
+        const dismissed = await flushPendingTerminals();
+        if (!dismissed) {
+          setStatus('本次提示已取消；正在重试取消确认，不会重复显示。');
+          return;
+        }
+        shouldContinue = true;
+        setStatus('本次提示已取消，不会重复显示。');
+        return;
+      }
+
       rememberPendingAck(eventId);
-      const acked = await flushPendingAcks();
+      const acked = await flushPendingTerminals();
       if (!acked) {
         setStatus('事件已显示，正在重试送达确认；不会重复显示。');
         return;

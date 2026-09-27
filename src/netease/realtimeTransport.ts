@@ -1,12 +1,15 @@
+import { fork } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { asRecord, readNumber, readString, type RealtimeCredentials } from "./types.js";
 
 const NIM_APP_KEY = "3a6a3e48f6854dfa4e4464f3bdaec3b4";
 const ENTER_TIMEOUT_MS = 15_000;
-const IM_RECOVERY_TIMEOUT_MS = 20_000;
+const BOOTSTRAP_TIMEOUT_MS = 20_000;
 const SEND_TIMEOUT_MS = 10_000;
 const MAX_CHAT_TEXT_LENGTH = 500;
 const MAX_JSON_STRING_BYTES = 65_536;
@@ -22,6 +25,8 @@ export type RealtimePlaybackEvent = {
   progressMs: number;
   playStatus: RealtimePlayStatus;
   receivedAtMs: number;
+  clientSeq?: number;
+  senderId?: string;
 };
 
 export type RealtimeChatRoomMessage = {
@@ -99,7 +104,7 @@ type NimClientLike = {
   init(appKey: string, appDataDir: string, appInstallDir: string, config: Record<string, unknown>): boolean;
   initEventHandlers(): void;
   login(appKey: string, account: string, password: string, cb: null, extension: string): Promise<[unknown]>;
-  on?(event: string, handler: EventHandler): unknown;
+  cleanup(jsonExtension: string): void;
 };
 
 type NimPluginLike = {
@@ -116,12 +121,6 @@ type NodeNimModule = {
 type PendingEnter = {
   generation: number;
   roomNumber: number;
-  resolve: () => void;
-  reject: (error: Error) => void;
-};
-
-type ImReadyWaiter = {
-  timeout: ReturnType<typeof setTimeout>;
   resolve: () => void;
   reject: (error: Error) => void;
 };
@@ -204,6 +203,67 @@ function findPlaybackEnvelope(value: unknown, depth = 0): Record<string, unknown
   return null;
 }
 
+const PLAYBACK_DIAGNOSTIC_KEYS = new Set([
+  "event_type",
+  "type",
+  "commandType",
+  "command",
+  "commandInfo",
+  "config",
+  "content",
+  "data",
+  "targetSongId",
+  "formerSongId",
+  "songId",
+  "progress",
+  "playStatus",
+  "serverSeq",
+  "clientSeq",
+  "commandId",
+  "roomId",
+  "bizType",
+  "ltType",
+  "appName",
+  "clientExt",
+]);
+
+function sanitizePlaybackDiagnostic(value: unknown, depth = 0): unknown {
+  if (depth > 6) return "[max-depth]";
+  const parsed = parseJsonString(value);
+  if (Array.isArray(parsed)) {
+    return parsed.slice(0, 16).map((item) => sanitizePlaybackDiagnostic(item, depth + 1));
+  }
+  if (!parsed || typeof parsed !== "object") return parsed;
+
+  const object = parsed as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  for (const [key, nested] of Object.entries(object)) {
+    if (PLAYBACK_DIAGNOSTIC_KEYS.has(key)) {
+      result[key] = sanitizePlaybackDiagnostic(nested, depth + 1);
+    }
+  }
+  return result;
+}
+
+export function buildPlaybackDiagnostic(raw: unknown): Record<string, unknown> | null {
+  const message = asRecord(raw);
+  const envelope = findPlaybackEnvelope(raw);
+  if (!envelope) return null;
+
+  const setting = asRecord(message.msg_setting_);
+  const senderId = readString(message.from_id_);
+  const messageId = readString(message.client_msg_id_);
+  return {
+    msgType: readNumber(message.msg_type_),
+    subType: readNumber(message.sub_type_),
+    senderSuffix: senderId ? senderId.slice(-4) : null,
+    messageIdSuffix: messageId ? messageId.slice(-6) : null,
+    attach: sanitizePlaybackDiagnostic(message.msg_attach_),
+    settingExt: sanitizePlaybackDiagnostic(setting.ext_),
+    envelope: sanitizePlaybackDiagnostic(envelope),
+  };
+}
+
 export function decodeRealtimePlaybackEvent(
   raw: unknown,
   receivedAtMs = Date.now(),
@@ -215,6 +275,8 @@ export function decodeRealtimePlaybackEvent(
 
   const progress = readNumber(command.progress);
   const serverSeq = readNumber(command.serverSeq) ?? readNumber(envelope.serverSeq);
+  const clientSeq = readNumber(command.clientSeq);
+  const senderId = readString(asRecord(raw).from_id_);
   return {
     type: "playback",
     serverSeq,
@@ -224,6 +286,8 @@ export function decodeRealtimePlaybackEvent(
     progressMs: Math.max(0, progress ?? 0),
     playStatus: normalizeStatus(command.playStatus),
     receivedAtMs,
+    ...(clientSeq === null ? {} : { clientSeq }),
+    ...(senderId ? { senderId } : {}),
   };
 }
 
@@ -352,12 +416,7 @@ async function loadNodeNim(): Promise<NodeNimModule> {
 
 export class NeteaseRealtimeTransport {
   private chatroom: ChatRoomLike | null = null;
-  private nimClient: NimClientLike | null = null;
-  private nimPlugin: NimPluginLike | null = null;
   private runtimeReady = false;
-  private loggedInAccount: string | null = null;
-  private imOnline = false;
-  private readonly imReadyWaiters = new Set<ImReadyWaiter>();
   private readonly pendingSends = new Map<string, PendingSend>();
   private roomNumber: number | null = null;
   private connecting: Promise<void> | null = null;
@@ -369,6 +428,7 @@ export class NeteaseRealtimeTransport {
   constructor(
     private readonly enabled = true,
     private readonly onChatMessage?: (message: RealtimeChatRoomMessage) => void,
+    private readonly onPlaybackEvent?: (event: RealtimePlaybackEvent) => void,
   ) {
     this.status = {
       enabled,
@@ -414,106 +474,147 @@ export class NeteaseRealtimeTransport {
     return this.connecting;
   }
 
-  private markImOnline(): void {
-    this.imOnline = true;
-    for (const waiter of this.imReadyWaiters) {
-      clearTimeout(waiter.timeout);
-      waiter.resolve();
+  private async ensureRuntime(): Promise<void> {
+    if (this.runtimeReady) return;
+
+    const nim = await loadNodeNim();
+    const chatroom = new nim.ChatRoom();
+    console.log("NIM diag: before chatroom.init");
+    if (!chatroom.init("", "")) {
+      throw new Error("NIM chatroom initialization failed");
     }
-    this.imReadyWaiters.clear();
+    console.log("NIM diag: after chatroom.init");
+    chatroom.initEventHandlers();
+
+    this.chatroom = chatroom;
+    this.installRuntimeHandlers(chatroom);
+    this.runtimeReady = true;
+    console.log("NetEase NIM ChatRoom runtime initialized once for this process");
   }
 
-  private markImOffline(): void {
-    this.imOnline = false;
-  }
-
-  private rejectImReadyWaiters(error: Error): void {
-    for (const waiter of this.imReadyWaiters) {
-      clearTimeout(waiter.timeout);
-      waiter.reject(error);
-    }
-    this.imReadyWaiters.clear();
-  }
-
-  private async waitForImRecovery(): Promise<void> {
-    if (this.imOnline) return;
-    await new Promise<void>((resolve, reject) => {
-      let waiter!: ImReadyWaiter;
-      const timeout = setTimeout(() => {
-        this.imReadyWaiters.delete(waiter);
-        reject(new Error("NIM client relogin timed out"));
-      }, IM_RECOVERY_TIMEOUT_MS);
-      timeout.unref?.();
-      waiter = { timeout, resolve, reject };
-      this.imReadyWaiters.add(waiter);
-    });
-  }
-
-  private async ensureRuntime(credentials: RealtimeCredentials): Promise<void> {
-    if (!this.runtimeReady) {
-      const dataDir = join(tmpdir(), `cove-nim-${process.pid}`);
-      await mkdir(dataDir, { recursive: true });
-      const nim = await loadNodeNim();
-      const client = new nim.NIMClient();
-      const plugin = new nim.NIMPlugin();
-      const chatroom = new nim.ChatRoom();
-
-      const nimConfig = {
-        database_encrypt_key_: NIM_APP_KEY,
-        use_https_: true,
-      };
-      console.log("NIM diag: before client.init");
-      if (!client.init(NIM_APP_KEY, `${dataDir}/`, "", nimConfig)) {
-        throw new Error("NIM client initialization failed");
-      }
-      console.log("NIM diag: after client.init");
-      client.initEventHandlers();
-      plugin.initEventHandlers();
-      console.log("NIM diag: before chatroom.init");
-      if (!chatroom.init("", "")) {
-        throw new Error("NIM chatroom initialization failed");
-      }
-      console.log("NIM diag: after chatroom.init");
-      chatroom.initEventHandlers();
-
-      this.nimClient = client;
-      this.nimPlugin = plugin;
-      this.chatroom = chatroom;
-      this.installRuntimeHandlers(chatroom, client);
-      this.runtimeReady = true;
-      console.log("NetEase NIM native runtime initialized once for this process");
-    }
-
-    if (this.loggedInAccount && this.loggedInAccount !== credentials.accId) {
-      throw new Error("NIM runtime is already bound to a different account");
-    }
-
-    if (this.loggedInAccount === credentials.accId) {
-      if (!this.imOnline) {
-        console.log("NetEase NIM client is recovering internally; waiting before chatroom re-entry");
-        await this.waitForImRecovery();
-      }
-      return;
-    }
-
-    const client = this.nimClient;
-    if (!client) throw new Error("NIM client is unavailable");
-    const [loginResult] = await client.login(
-      NIM_APP_KEY,
-      credentials.accId,
-      credentials.token,
-      null,
-      "",
+  // Isolate the short-lived IM bootstrap client in a child process.
+  // node-nim cleanup can occasionally spin a native HTTP thread on Linux and
+  // starve the whole Bridge process. The child only obtains the fresh ChatRoom
+  // enter ticket; the parent kills it afterwards so the OS tears down all
+  // native bootstrap threads without depending on SDK cleanup.
+  private async requestEnterTicket(
+    credentials: RealtimeCredentials,
+    roomNumber: number,
+  ): Promise<[number, string]> {
+    const dataDir = join(
+      tmpdir(),
+      `cove-nim-bootstrap-${process.pid}-${randomUUID()}`,
     );
-    const loginCode = readNumber(asRecord(loginResult).res_code_);
-    if (loginCode !== 200) {
-      throw new Error(`NIM login failed${loginCode === null ? "" : ` code=${loginCode}`}`);
+    const compiledModule = fileURLToPath(
+      new URL("./nimTicketBootstrap.js", import.meta.url),
+    );
+    const sourceModule = fileURLToPath(
+      new URL("./nimTicketBootstrap.ts", import.meta.url),
+    );
+    const useSourceModule = !existsSync(compiledModule) && existsSync(sourceModule);
+    const modulePath = useSourceModule ? sourceModule : compiledModule;
+
+    if (!existsSync(modulePath)) {
+      throw new Error("NIM ticket bootstrap module is unavailable");
     }
-    this.loggedInAccount = credentials.accId;
-    this.markImOnline();
+
+    console.log("NIM diag: starting isolated bootstrap child");
+    const child = fork(modulePath, [], {
+      execArgv: useSourceModule ? ["--import", "tsx"] : [],
+      stdio: ["ignore", "ignore", "pipe", "ipc"],
+    });
+
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      stderr = (stderr + String(chunk)).slice(-2000);
+    });
+
+    try {
+      const result = await new Promise<[number, string]>((resolve, reject) => {
+        let settled = false;
+        let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+
+        const finish = (callback: () => void) => {
+          if (settled) return;
+          settled = true;
+          if (timeoutHandle) clearTimeout(timeoutHandle);
+          callback();
+        };
+
+        timeoutHandle = setTimeout(() => {
+          finish(() => reject(new Error("NIM ticket bootstrap timed out")));
+        }, BOOTSTRAP_TIMEOUT_MS);
+        timeoutHandle.unref?.();
+
+        child.once("error", (error) => {
+          finish(() => reject(error));
+        });
+
+        child.once("exit", (code, signal) => {
+          finish(() => reject(new Error(
+            "NIM ticket bootstrap exited before reply"
+            + ` code=${String(code)} signal=${String(signal)}`
+            + (stderr ? ` stderr=${stderr.slice(-400)}` : ""),
+          )));
+        });
+
+        child.once("message", (raw) => {
+          const message = asRecord(raw);
+          if (message.ok !== true) {
+            finish(() => reject(new Error(
+              readString(message.error) || "NIM ticket bootstrap failed",
+            )));
+            return;
+          }
+
+          const rawResult = message.result;
+          if (!Array.isArray(rawResult) || rawResult.length < 2) {
+            finish(() => reject(new Error("NIM ticket bootstrap returned an invalid result")));
+            return;
+          }
+          const code = readNumber(rawResult[0]);
+          const ticket = readString(rawResult[1]);
+          if (code === null || !ticket) {
+            finish(() => reject(new Error("NIM ticket bootstrap returned an invalid ticket")));
+            return;
+          }
+          finish(() => resolve([code, ticket]));
+        });
+
+        child.send({
+          appKey: NIM_APP_KEY,
+          dataDir,
+          accId: credentials.accId,
+          token: credentials.token,
+          roomNumber,
+        }, (error) => {
+          if (error) finish(() => reject(error));
+        });
+      });
+
+      console.log("NetEase NIM enter ticket acquired in isolated bootstrap child");
+      return result;
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      await new Promise<void>((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          resolve();
+          return;
+        }
+        const timer = setTimeout(resolve, 1000);
+        timer.unref?.();
+        child.once("exit", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+      await rm(dataDir, { recursive: true, force: true }).catch(() => {});
+    }
   }
 
-  private installRuntimeHandlers(chatroom: ChatRoomLike, client: NimClientLike): void {
+  private installRuntimeHandlers(chatroom: ChatRoomLike): void {
     chatroom.on("enter", (...args: unknown[]) => {
       const room = readNumber(args[0]);
       const step = readNumber(args[1]);
@@ -561,6 +662,18 @@ export class NeteaseRealtimeTransport {
         console.log(
           `NetEase realtime playback event: command=${event.commandType ?? "UNKNOWN"} songId=${event.songId ?? "unknown"} progressMs=${event.progressMs} serverSeq=${event.serverSeq ?? "unknown"} latencyAnchor=receivedAt`,
         );
+        if (/^(1|true|on|yes)$/i.test(process.env.TOGETHER_PLAYBACK_DIAGNOSTICS?.trim() ?? "")) {
+          const diagnostic = buildPlaybackDiagnostic(args[1]);
+          if (diagnostic) {
+            console.log(`NetEase playback diagnostic: ${JSON.stringify(diagnostic)}`);
+          }
+        }
+        try {
+          this.onPlaybackEvent?.(event);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : "unknown error";
+          console.error(`NetEase realtime playback sink failed: ${detail}`);
+        }
         return;
       }
 
@@ -613,63 +726,6 @@ export class NeteaseRealtimeTransport {
       }
     });
 
-    client.on?.("disconnect", () => {
-      this.markImOffline();
-      console.warn("NetEase NIM IM link disconnected; ChatRoom state left unchanged");
-    });
-
-    client.on?.("relogin", (...args: unknown[]) => {
-      const result = asRecord(args[0]);
-      const code = readNumber(result.res_code_);
-      const step = readNumber(result.login_step_);
-      const retrying = result.retrying_ === true;
-
-      if (code === 200 && step === 3) {
-        this.markImOnline();
-        console.log("NetEase NIM client relogin recovered; ChatRoom state left unchanged");
-        return;
-      }
-
-      if (code !== null) {
-        console.warn(`NetEase NIM client relogin pending code=${code} retrying=${retrying}`);
-      }
-      if (code !== 200 && !retrying) {
-        this.rejectImReadyWaiters(
-          new Error(`NIM client relogin failed${code === null ? "" : ` code=${code}`}`),
-        );
-      }
-    });
-
-    client.on?.("multispotLogin", (...args: unknown[]) => {
-  const result = asRecord(args[0]);
-  const notifyType = readNumber(result.notify_type_);
-  const peerCandidates = [result.other_clients_, result.online_clients_, result.clients_]
-    .find((value) => Array.isArray(value));
-  const peers = Array.isArray(peerCandidates) ? peerCandidates : [];
-  const peerTypes = peers.slice(0, 8).map((peer) => {
-    const info = asRecord(peer);
-    return {
-      clientType: readNumber(info.client_type_),
-      customClientType: readNumber(info.custom_client_type_),
-    };
-  });
-  console.warn(
-    `NetEase NIM multispot login: notifyType=${notifyType ?? "unknown"} peerCount=${peers.length} peerTypes=${JSON.stringify(peerTypes)} fields=${Object.keys(result).join(",")}`,
-  );
-});
-
-client.on?.("kickout", (...args: unknown[]) => {
-  const result = asRecord(args[0]);
-  const reason = readNumber(result.kick_reason_) ?? readNumber(result.reason_);
-  const clientType = readNumber(result.client_type_);
-  const customClientType = readNumber(result.custom_client_type_);
-  this.markImOffline();
-  this.loggedInAccount = null;
-  this.rejectImReadyWaiters(new Error("NIM client was kicked out"));
-  console.warn(
-    `NetEase NIM client was kicked out: reason=${reason ?? "unknown"} clientType=${clientType ?? "unknown"} customClientType=${customClientType ?? "unknown"} fields=${Object.keys(result).join(",")}`,
-  );
-});
   }
 
   private async connectInternal(options: ConnectOptions): Promise<void> {
@@ -686,10 +742,9 @@ client.on?.("kickout", (...args: unknown[]) => {
       lastError: null,
     };
 
-    await this.ensureRuntime(options.credentials);
+    await this.ensureRuntime();
     const chatroom = this.chatroom;
-    const plugin = this.nimPlugin;
-    if (!chatroom || !plugin) throw new Error("NIM realtime runtime is unavailable");
+    if (!chatroom) throw new Error("NIM realtime runtime is unavailable");
 
     if (this.roomNumber !== null && this.roomNumber !== roomNumber) {
       try {
@@ -700,7 +755,8 @@ client.on?.("kickout", (...args: unknown[]) => {
     }
     this.roomNumber = roomNumber;
 
-    const [requestCode, requestLoginData] = await plugin.chatRoomRequestEnterAsync(roomNumber, null, "");
+    const [requestCode, requestLoginData] =
+      await this.requestEnterTicket(options.credentials, roomNumber);
     if (requestCode !== 200 || !requestLoginData) {
       throw new Error(`NIM chatroom enter ticket failed code=${requestCode}`);
     }

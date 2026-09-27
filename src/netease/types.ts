@@ -38,6 +38,7 @@ export type SongDetails = {
   name: string;
   artist: string;
   durationMs: number;
+  coverUrl?: string;
 };
 
 export type RawLyrics = {
