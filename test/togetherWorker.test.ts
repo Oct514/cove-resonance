@@ -989,3 +989,80 @@ test("GOTO rejects a target outside the current Together displayList before repo
   );
   assert.equal(reported, false);
 });
+
+test("leaveTogether ends the authoritative room and clears local room state after confirmation", async () => {
+  const events: Array<{ source: string; text: string }> = [];
+  const worker = new TogetherWorker({
+    cookie: "",
+    enabled: false,
+    onEvent: (source, text) => events.push({ source, text }),
+  });
+
+  let statusReads = 0;
+  let endedRoomId: string | null = null;
+  const internals = worker as unknown as {
+    enterRoom: (roomId: string, chatRoomId?: string | null) => void;
+    client: {
+      getRoomStatus: () => Promise<{ inRoom: boolean; roomId: string | null; chatRoomId: string | null }>;
+      endRoom: (roomId: string) => Promise<void>;
+    };
+  };
+  internals.enterRoom("host-room", "chat-room");
+  internals.client.getRoomStatus = async () => {
+    statusReads += 1;
+    return statusReads === 1
+      ? { inRoom: true, roomId: "host-room", chatRoomId: "chat-room" }
+      : { inRoom: false, roomId: null, chatRoomId: null };
+  };
+  internals.client.endRoom = async (roomId) => {
+    endedRoomId = roomId;
+  };
+
+  const result = await worker.leaveTogether();
+
+  assert.equal(endedRoomId, "host-room");
+  assert.equal(statusReads, 2);
+  assert.equal(result.ok, true);
+  assert.equal(result.ended, true);
+  assert.equal(result.alreadyOut, false);
+  assert.equal(result.roomId, "host-room");
+  assert.equal(worker.getStatus().roomId, null);
+  assert.equal(worker.getStatus().phase, "waiting_invite");
+  assert.deepEqual(events, [{
+    source: "netease.together",
+    text: "一起听已退出。我会继续等你的下一次邀请。",
+  }]);
+});
+
+test("leaveTogether is a confirmed no-op when authoritative status is already out", async () => {
+  const worker = new TogetherWorker({
+    cookie: "",
+    enabled: false,
+    onEvent: () => {},
+  });
+
+  let endCalls = 0;
+  const internals = worker as unknown as {
+    client: {
+      getRoomStatus: () => Promise<{ inRoom: boolean; roomId: string | null; chatRoomId: string | null }>;
+      endRoom: (roomId: string) => Promise<void>;
+    };
+  };
+  internals.client.getRoomStatus = async () => ({
+    inRoom: false,
+    roomId: null,
+    chatRoomId: null,
+  });
+  internals.client.endRoom = async () => {
+    endCalls += 1;
+  };
+
+  const result = await worker.leaveTogether();
+
+  assert.equal(endCalls, 0);
+  assert.equal(result.ok, true);
+  assert.equal(result.ended, false);
+  assert.equal(result.alreadyOut, true);
+  assert.equal(result.roomId, null);
+  assert.equal(worker.getStatus().phase, "waiting_invite");
+});
