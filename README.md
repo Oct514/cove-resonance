@@ -121,6 +121,10 @@ V2 已跑通。下一阶段优先建议：
 - [WenXiaoWendy/galatea-garden-wake-bridge](https://github.com/WenXiaoWendy/galatea-garden-wake-bridge)
 - [Vael-KY/netease-music-mcp](https://github.com/Vael-KY/netease-music-mcp)
 
+## License
+
+Licensed under the **MIT License**. See [LICENSE](LICENSE).
+
 > **不搬 AI，给 AI 修路。**
 
 Built by **Yancey × Cove**.
