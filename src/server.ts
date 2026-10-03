@@ -14,6 +14,10 @@ import { InMemoryEventQueue } from "./queue.js";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const INGEST_TOKEN = process.env.BRIDGE_INGEST_TOKEN ?? "";
+// MCP 端点鉴权：优先 BRIDGE_MCP_TOKEN，未设置时回退到 BRIDGE_INGEST_TOKEN。
+// 两者都为空时 MCP 一律拒绝（fail-closed），避免裸奔。
+const MCP_TOKEN = (process.env.BRIDGE_MCP_TOKEN ?? process.env.BRIDGE_INGEST_TOKEN ?? "").trim();
+
 const UNIX_SOCKET = process.env.BRIDGE_UNIX_SOCKET?.trim() ?? "";
 const queue = new InMemoryEventQueue();
 const playbackState = new PlaybackStateStore();
@@ -65,7 +69,13 @@ function authorized(req: IncomingMessage): boolean {
   return !INGEST_TOKEN || req.headers.authorization === `Bearer ${INGEST_TOKEN}`;
 }
 
+function authorizedMcp(req: IncomingMessage): boolean {
+  if (!MCP_TOKEN) return false;
+  return req.headers.authorization === `Bearer ${MCP_TOKEN}`;
+}
+
 export function createHttpServer() {
+
   return createServer(async (req, res) => {
     if (!req.url || !req.method) {
       res.writeHead(400).end("Bad Request");
@@ -139,6 +149,11 @@ export function createHttpServer() {
     if (mcpProfile && mcpMethods.has(req.method)) {
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+      if (!authorizedMcp(req)) {
+        console.warn(`[cove] MCP request rejected path=${url.pathname}`);
+        writeJson(res, 401, { error: "unauthorized" });
+        return;
+      }
       const server = createMcpServer(queue, playbackState, togetherWorker, mcpProfile);
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
